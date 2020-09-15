@@ -145,6 +145,8 @@ Resources:
         rules_to_suppress:
           - id: W28
             reason: Static Name assigned, via mapping, for export consistency accross regions/accounts
+          - id: W43
+            reason: Administrator Access is required in order to allow Terraform to deploy any type of resources
     Properties:
       RoleName: !FindInMap [ RoleMap, Roles, TFAdminRoleName ]
       AssumeRolePolicyDocument:
