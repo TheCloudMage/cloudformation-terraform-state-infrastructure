@@ -1,0 +1,1157 @@
+{
+    "AWSTemplateFormatVersion": "2010-09-09",
+    "Description": "AWS CloudFormation Template to prepare an account for Terraform usage. Creates state encrypted bucket, dynamo table, user, role.",
+    "Parameters": {
+        "CreateTFAdminRole": {
+            "Description": "Create a Terraform administrator role that would have Administrator permissions, to allow the assumer of the role to deploy resources into the account. Note this value should only be set to false if the role has already been deployed into the account previously.",
+            "Type": "String",
+            "AllowedValues": [
+                "true",
+                "false"
+            ],
+            "Default": "true"
+        },
+        "CreateTFUser": {
+            "Description": "Create a Terraform user that would have ReadOnly permissions, the ability to manage its own IAM password/mfa, and the ability to assume the TerraForm Admin Role.",
+            "Type": "String",
+            "AllowedValues": [
+                "true",
+                "false"
+            ],
+            "Default": "true"
+        },
+        "TFUserKeySerial": {
+            "Description": "The serial number of the provisioned TFStateUser IAM user programmatic access key. Incrementing this number from its current value will rotate the user key during the next stack update.",
+            "Type": "Number",
+            "Default": 1
+        },
+        "AdditionalAdminRoleAccess": {
+            "Description": "Optional => Role ARNs supplied will have access to assume the TFAdmin Role. This should be input as a comma separated non spaced string such as \"User1ARN,User2ARN,User3ARN\"",
+            "Type": "CommaDelimitedList"
+        },
+        "CreateStateBucket": {
+            "Description": "Create an encrypted Terraform state bucket to be used to store Terraform state and infrastructure changes. If using a product such as Terraform Cloud, or Terraform Enterprise that manages state for you, then choose false to skip creating this resource.",
+            "Type": "String",
+            "AllowedValues": [
+                "true",
+                "false"
+            ],
+            "Default": "true"
+        },
+        "CreateSharedKMSKey": {
+            "Description": "Create a sharable KMS CMK that will be used to encrypt the objects stored in the Terraform state bucket, as well as the Terraform state lock table in DynamoDB. If \"false\" is selected then the standard AWS managed key s3/dynamo keys will be used.",
+            "Type": "String",
+            "AllowedValues": [
+                "true",
+                "false"
+            ],
+            "Default": "true"
+        },
+        "SharedKMSKeyAlias": {
+            "Description": "Specify the alias that will be set on the optionally provisioned shared KMS CMK. Note 'alias/' will automatically be appended to the key and should not be specified in this parameter.",
+            "Type": "String",
+            "Default": "terraform/state"
+        }
+    },
+    "Metadata": {
+        "AWS::CloudFormation::Interface": {
+            "ParameterGroups": [
+                {
+                    "Label": {
+                        "default": "Template Parameters"
+                    },
+                    "Parameters": [
+                        "CreateTFAdminRole",
+                        "CreateTFUser",
+                        "CreateStateBucket",
+                        "CreateSharedKMSKey"
+                    ]
+                },
+                {
+                    "Label": {
+                        "default": "Optional Template Parameters"
+                    },
+                    "Parameters": [
+                        "AdditionalAdminRoleAccess",
+                        "TFUserKeySerial",
+                        "SharedKMSKeyAlias"
+                    ]
+                }
+            ],
+            "ParameterLabels": {
+                "CreateTFAdminRole": {
+                    "default": "Provision Terraform IAM Admin Role?"
+                },
+                "CreateTFUser": {
+                    "default": "Provision Terraform IAM User?"
+                },
+                "CreateStateBucket": {
+                    "default": "Provision Terraform encrypted state bucket?"
+                },
+                "CreateSharedKMSKey": {
+                    "default": "Provision Terraform sharable KMS Customer Managed Key (CMK)?"
+                },
+                "AdditionalAdminRoleAccess": {
+                    "default": "Specify any existing IAM Role ARNs that will be granted access to assume the Terraform admin role."
+                },
+                "TFUserKeySerial": {
+                    "default": "Serial Number for the TFState IAM users programmatic access keys."
+                },
+                "SharedKMSKeyAlias": {
+                    "default": "Specify the Alias for the KMS CMK if provisioned."
+                }
+            }
+        }
+    },
+    "Mappings": {
+        "RoleMap": {
+            "Roles": {
+                "TFAdminRoleName": "TerraForm-Infrastructure-Services-Admin-Role"
+            }
+        }
+    },
+    "Conditions": {
+        "CreateRole": {
+            "Fn::Equals": [
+                {
+                    "Ref": "CreateTFAdminRole"
+                },
+                "true"
+            ]
+        },
+        "ProvisionTFUser": {
+            "Fn::And": [
+                {
+                    "Condition": "CreateRole"
+                },
+                {
+                    "Fn::Equals": [
+                        {
+                            "Ref": "CreateTFUser"
+                        },
+                        "true"
+                    ]
+                }
+            ]
+        },
+        "ProvisionStateBucket": {
+            "Fn::Equals": [
+                {
+                    "Ref": "CreateStateBucket"
+                },
+                "true"
+            ]
+        },
+        "ProvisionCMK": {
+            "Fn::Equals": [
+                {
+                    "Ref": "CreateSharedKMSKey"
+                },
+                "true"
+            ]
+        },
+        "RequestedRoleAccess": {
+            "Fn::Not": [
+                {
+                    "Fn::Equals": [
+                        {
+                            "Fn::Join": [
+                                ",",
+                                {
+                                    "Ref": "AdditionalAdminRoleAccess"
+                                }
+                            ]
+                        },
+                        ""
+                    ]
+                }
+            ]
+        },
+        "ProvisionTFUserPolicy": {
+            "Fn::And": [
+                {
+                    "Condition": "ProvisionTFUser"
+                },
+                {
+                    "Condition": "ProvisionStateBucket"
+                }
+            ]
+        }
+    },
+    "Resources": {
+        "TFAdminRole": {
+            "Type": "AWS::IAM::Role",
+            "Condition": "CreateRole",
+            "Metadata": {
+                "cfn_nag": {
+                    "rules_to_suppress": [
+                        {
+                            "id": "W28",
+                            "reason": "Static Name assigned, via mapping, for export consistency accross regions/accounts"
+                        }
+                    ]
+                }
+            },
+            "Properties": {
+                "RoleName": {
+                    "Fn::FindInMap": [
+                        "RoleMap",
+                        "Roles",
+                        "TFAdminRoleName"
+                    ]
+                },
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "AWS": {
+                                    "Fn::Split": [
+                                        ",",
+                                        {
+                                            "Fn::Join": [
+                                                ",",
+                                                [
+                                                    {
+                                                        "Fn::If": [
+                                                            "ProvisionTFUser",
+                                                            {
+                                                                "Fn::GetAtt": [
+                                                                    "TFStateUser",
+                                                                    "Arn"
+                                                                ]
+                                                            },
+                                                            {
+                                                                "Ref": "AWS::AccountId"
+                                                            }
+                                                        ]
+                                                    },
+                                                    {
+                                                        "Fn::If": [
+                                                            "RequestedRoleAccess",
+                                                            {
+                                                                "Fn::Join": [
+                                                                    ",",
+                                                                    {
+                                                                        "Ref": "AdditionalAdminRoleAccess"
+                                                                    }
+                                                                ]
+                                                            },
+                                                            {
+                                                                "Ref": "AWS::NoValue"
+                                                            }
+                                                        ]
+                                                    }
+                                                ]
+                                            ]
+                                        }
+                                    ]
+                                }
+                            },
+                            "Action": [
+                                "sts:AssumeRole"
+                            ]
+                        }
+                    ]
+                },
+                "Path": "/",
+                "ManagedPolicyArns": [
+                    "arn:aws:iam::aws:policy/AdministratorAccess"
+                ]
+            }
+        },
+        "TFStateKMSKey": {
+            "Condition": "ProvisionCMK",
+            "Type": "AWS::KMS::Key",
+            "Properties": {
+                "Description": "Terraform State Infrastructure KMS Encryption Key",
+                "Enabled": true,
+                "EnableKeyRotation": true,
+                "KeyPolicy": {
+                    "Version": "2012-10-17",
+                    "Id": {
+                        "Fn::Sub": "Terraform-State-CMK-Policy-${AWS::Region}"
+                    },
+                    "Statement": [
+                        {
+                            "Sid": "TFStateKeyOwnerPolicy",
+                            "Effect": "Allow",
+                            "Principal": {
+                                "AWS": {
+                                    "Fn::Sub": "arn:aws:iam::${AWS::AccountId}:root"
+                                }
+                            },
+                            "Action": [
+                                "kms:*"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "TFStateKeyAdminPolicy",
+                            "Effect": "Allow",
+                            "Principal": {
+                                "AWS": {
+                                    "Fn::Sub": "arn:aws:iam::${AWS::AccountId}:root"
+                                }
+                            },
+                            "Action": [
+                                "kms:Create*",
+                                "kms:Describe*",
+                                "kms:Enable*",
+                                "kms:List*",
+                                "kms:Put*",
+                                "kms:Update*",
+                                "kms:Revoke*",
+                                "kms:Disable*",
+                                "kms:Get*",
+                                "kms:Delete*",
+                                "kms:ScheduleKeyDeletion",
+                                "kms:CancelKeyDeletion"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "TFStateKeyUsagePolicy",
+                            "Effect": "Allow",
+                            "Principal": {
+                                "AWS": {
+                                    "Fn::If": [
+                                        "CreateRole",
+                                        {
+                                            "Fn::GetAtt": [
+                                                "TFAdminRole",
+                                                "Arn"
+                                            ]
+                                        },
+                                        {
+                                            "Fn::Join": [
+                                                "",
+                                                [
+                                                    "arn:aws:iam::",
+                                                    {
+                                                        "Ref": "AWS::AccountId"
+                                                    },
+                                                    ":role/",
+                                                    {
+                                                        "Fn::FindInMap": [
+                                                            "RoleMap",
+                                                            "Roles",
+                                                            "TFAdminRoleName"
+                                                        ]
+                                                    }
+                                                ]
+                                            ]
+                                        }
+                                    ]
+                                }
+                            },
+                            "Action": [
+                                "kms:Encrypt",
+                                "kms:Decrypt",
+                                "kms:ReEncrypt*",
+                                "kms:GenerateDataKey*",
+                                "kms:DescribeKey"
+                            ],
+                            "Resource": "*"
+                        }
+                    ]
+                }
+            }
+        },
+        "TFStateKMSKeyAlias": {
+            "Condition": "ProvisionCMK",
+            "Type": "AWS::KMS::Alias",
+            "Properties": {
+                "AliasName": {
+                    "Fn::Sub": "alias/${SharedKMSKeyAlias}"
+                },
+                "TargetKeyId": {
+                    "Fn::GetAtt": [
+                        "TFStateKMSKey",
+                        "Arn"
+                    ]
+                }
+            }
+        },
+        "TFStateBucket": {
+            "Type": "AWS::S3::Bucket",
+            "Condition": "ProvisionStateBucket",
+            "Metadata": {
+                "cfn_nag": {
+                    "rules_to_suppress": [
+                        {
+                            "id": "W35",
+                            "reason": "Logging bucket can be setup with TerraForm once access is granted."
+                        }
+                    ]
+                }
+            },
+            "Properties": {
+                "BucketName": {
+                    "Fn::Sub": "${AWS::AccountId}-terraform-state-bucket-${AWS::Region}"
+                },
+                "VersioningConfiguration": {
+                    "Status": "Enabled"
+                },
+                "BucketEncryption": {
+                    "ServerSideEncryptionConfiguration": [
+                        {
+                            "ServerSideEncryptionByDefault": {
+                                "SSEAlgorithm": {
+                                    "Fn::If": [
+                                        "ProvisionCMK",
+                                        "aws:kms",
+                                        "AES256"
+                                    ]
+                                },
+                                "KMSMasterKeyID": {
+                                    "Fn::If": [
+                                        "ProvisionCMK",
+                                        {
+                                            "Ref": "TFStateKMSKey"
+                                        },
+                                        {
+                                            "Ref": "AWS::NoValue"
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        "TFStateBucketPolicy": {
+            "Type": "AWS::S3::BucketPolicy",
+            "Condition": "ProvisionStateBucket",
+            "Properties": {
+                "Bucket": {
+                    "Ref": "TFStateBucket"
+                },
+                "PolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "DenyNonSecureTransport",
+                            "Effect": "Deny",
+                            "Principal": {
+                                "AWS": "*"
+                            },
+                            "Action": [
+                                "s3:*"
+                            ],
+                            "Resource": [
+                                {
+                                    "Fn::GetAtt": [
+                                        "TFStateBucket",
+                                        "Arn"
+                                    ]
+                                },
+                                {
+                                    "Fn::Join": [
+                                        "/",
+                                        [
+                                            {
+                                                "Fn::GetAtt": [
+                                                    "TFStateBucket",
+                                                    "Arn"
+                                                ]
+                                            },
+                                            "*"
+                                        ]
+                                    ]
+                                }
+                            ],
+                            "Condition": {
+                                "Bool": {
+                                    "aws:SecureTransport": false
+                                }
+                            }
+                        },
+                        {
+                            "Sid": "DenyIncorrectEncryptionHeader",
+                            "Effect": "Deny",
+                            "Principal": {
+                                "AWS": "*"
+                            },
+                            "Action": "s3:PutObject",
+                            "Resource": [
+                                {
+                                    "Fn::GetAtt": [
+                                        "TFStateBucket",
+                                        "Arn"
+                                    ]
+                                },
+                                {
+                                    "Fn::Join": [
+                                        "/",
+                                        [
+                                            {
+                                                "Fn::GetAtt": [
+                                                    "TFStateBucket",
+                                                    "Arn"
+                                                ]
+                                            },
+                                            "*"
+                                        ]
+                                    ]
+                                }
+                            ],
+                            "Condition": {
+                                "ForAnyValue:StringNotEquals": {
+                                    "s3:x-amz-server-side-encryption": [
+                                        "aws:kms",
+                                        "AES256"
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            "Sid": "DenyUnEncryptedObjectUploads",
+                            "Effect": "Deny",
+                            "Principal": {
+                                "AWS": "*"
+                            },
+                            "Action": "s3:PutObject",
+                            "Resource": [
+                                {
+                                    "Fn::GetAtt": [
+                                        "TFStateBucket",
+                                        "Arn"
+                                    ]
+                                },
+                                {
+                                    "Fn::Join": [
+                                        "/",
+                                        [
+                                            {
+                                                "Fn::GetAtt": [
+                                                    "TFStateBucket",
+                                                    "Arn"
+                                                ]
+                                            },
+                                            "*"
+                                        ]
+                                    ]
+                                }
+                            ],
+                            "Condition": {
+                                "Null": {
+                                    "s3:x-amz-server-side-encryption": "true"
+                                }
+                            }
+                        },
+                        {
+                            "Sid": "AllowTFAdminUsage",
+                            "Effect": "Allow",
+                            "Principal": {
+                                "AWS": {
+                                    "Fn::If": [
+                                        "CreateRole",
+                                        {
+                                            "Fn::GetAtt": [
+                                                "TFAdminRole",
+                                                "Arn"
+                                            ]
+                                        },
+                                        {
+                                            "Fn::Join": [
+                                                "",
+                                                [
+                                                    "arn:aws:iam::",
+                                                    {
+                                                        "Ref": "AWS::AccountId"
+                                                    },
+                                                    ":role/",
+                                                    {
+                                                        "Fn::FindInMap": [
+                                                            "RoleMap",
+                                                            "Roles",
+                                                            "TFAdminRoleName"
+                                                        ]
+                                                    }
+                                                ]
+                                            ]
+                                        }
+                                    ]
+                                }
+                            },
+                            "Action": "s3:*",
+                            "Resource": [
+                                {
+                                    "Fn::GetAtt": [
+                                        "TFStateBucket",
+                                        "Arn"
+                                    ]
+                                },
+                                {
+                                    "Fn::Join": [
+                                        "/",
+                                        [
+                                            {
+                                                "Fn::GetAtt": [
+                                                    "TFStateBucket",
+                                                    "Arn"
+                                                ]
+                                            },
+                                            "*"
+                                        ]
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        },
+        "DynamoTFLockTable": {
+            "Type": "AWS::DynamoDB::Table",
+            "Condition": "ProvisionStateBucket",
+            "Metadata": {
+                "cfn_nag": {
+                    "rules_to_suppress": [
+                        {
+                            "id": "W28",
+                            "reason": "Static Name assigned for consistency accross accounts and to be more easily identified within TF"
+                        }
+                    ]
+                }
+            },
+            "Properties": {
+                "TableName": "Terraform-State-Lock-Table",
+                "AttributeDefinitions": [
+                    {
+                        "AttributeName": "LockID",
+                        "AttributeType": "S"
+                    }
+                ],
+                "KeySchema": [
+                    {
+                        "AttributeName": "LockID",
+                        "KeyType": "HASH"
+                    }
+                ],
+                "ProvisionedThroughput": {
+                    "ReadCapacityUnits": 5,
+                    "WriteCapacityUnits": 5
+                },
+                "SSESpecification": {
+                    "SSEType": {
+                        "Fn::If": [
+                            "ProvisionCMK",
+                            "KMS",
+                            {
+                                "Ref": "AWS::NoValue"
+                            }
+                        ]
+                    },
+                    "SSEEnabled": {
+                        "Fn::If": [
+                            "ProvisionCMK",
+                            true,
+                            false
+                        ]
+                    },
+                    "KMSMasterKeyId": {
+                        "Fn::If": [
+                            "ProvisionCMK",
+                            {
+                                "Ref": "TFStateKMSKey"
+                            },
+                            {
+                                "Ref": "AWS::NoValue"
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        "TFStateUser": {
+            "Type": "AWS::IAM::User",
+            "Condition": "ProvisionTFUser",
+            "Metadata": {
+                "cfn_nag": {
+                    "rules_to_suppress": [
+                        {
+                            "id": "F2000",
+                            "reason": "User not assigned to group as group is un-necessary for single TF user, use case."
+                        }
+                    ]
+                }
+            },
+            "Properties": {
+                "UserName": "Terraform",
+                "ManagedPolicyArns": [
+                    "arn:aws:iam::aws:policy/ReadOnlyAccess"
+                ]
+            }
+        },
+        "TFStateUserKey": {
+            "Type": "AWS::IAM::AccessKey",
+            "Condition": "ProvisionTFUser",
+            "Properties": {
+                "Serial": {
+                    "Ref": "TFUserKeySerial"
+                },
+                "Status": "Active",
+                "UserName": {
+                    "Ref": "TFStateUser"
+                }
+            }
+        },
+        "TFStateUserKeySecret": {
+            "Type": "AWS::SecretsManager::Secret",
+            "Condition": "ProvisionTFUser",
+            "Properties": {
+                "Description": "TFState User Programmatic Access KeyPair",
+                "KmsKeyId": {
+                    "Fn::If": [
+                        "ProvisionCMK",
+                        {
+                            "Ref": "TFStateKMSKey"
+                        },
+                        {
+                            "Ref": "AWS::NoValue"
+                        }
+                    ]
+                },
+                "Name": "/Terraform/StateUser/AccessKeyPair",
+                "SecretString": {
+                    "Fn::Sub": "{\"AccessKey\": \"${TFStateUserKey}\", \"Secret\": \"${TFStateUserKey.SecretAccessKey}\"}"
+                }
+            }
+        },
+        "TFStateUserIAMPolicy": {
+            "Type": "AWS::IAM::Policy",
+            "Condition": "ProvisionTFUser",
+            "Metadata": {
+                "cfn_nag": {
+                    "rules_to_suppress": [
+                        {
+                            "id": "F11",
+                            "reason": "Assigning policy to user because the scope of these permissions pertains only to the TF Admin IAM User."
+                        },
+                        {
+                            "id": "W12",
+                            "reason": "The iam:GetAccountPasswordPolicy permission requires to be set to * to be able to grab the global password policy."
+                        }
+                    ]
+                }
+            },
+            "Properties": {
+                "PolicyName": "Terraform-State-User-IAM-AccessPolicy",
+                "PolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "AllowGetIAMSelfDetails",
+                            "Effect": "Allow",
+                            "Action": [
+                                "iam:GetAccountPasswordPolicy",
+                                "iam:ListVirtualMFADevices"
+                            ],
+                            "Resource": "*"
+                        },
+                        {
+                            "Sid": "AllowManageIAMSelfPassword",
+                            "Effect": "Allow",
+                            "Action": [
+                                "iam:GetUser",
+                                "iam:ChangePassword"
+                            ],
+                            "Resource": {
+                                "Fn::Join": [
+                                    "",
+                                    [
+                                        "arn:aws:iam::",
+                                        {
+                                            "Ref": "AWS::AccountId"
+                                        },
+                                        ":user/${aws:username}"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Sid": "AllowManageIAMSelfMFADevice",
+                            "Effect": "Allow",
+                            "Action": [
+                                "iam:CreateVirtualMFADevice",
+                                "iam:DeleteVirtualMFADevice"
+                            ],
+                            "Resource": {
+                                "Fn::Join": [
+                                    "",
+                                    [
+                                        "arn:aws:iam::",
+                                        {
+                                            "Ref": "AWS::AccountId"
+                                        },
+                                        ":mfa/${aws:username}"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Sid": "AllowManageIAMSelfMFA",
+                            "Effect": "Allow",
+                            "Action": [
+                                "iam:DeactivateMFADevice",
+                                "iam:EnableMFADevice",
+                                "iam:GetUser",
+                                "iam:ListMFADevices",
+                                "iam:ResyncMFADevice"
+                            ],
+                            "Resource": {
+                                "Fn::Join": [
+                                    "",
+                                    [
+                                        "arn:aws:iam::",
+                                        {
+                                            "Ref": "AWS::AccountId"
+                                        },
+                                        ":user/${aws:username}"
+                                    ]
+                                ]
+                            }
+                        },
+                        {
+                            "Sid": "AssumeTFAdminRole",
+                            "Effect": "Allow",
+                            "Action": [
+                                "sts:AssumeRole"
+                            ],
+                            "Resource": [
+                                {
+                                    "Fn::If": [
+                                        "CreateRole",
+                                        {
+                                            "Fn::GetAtt": [
+                                                "TFAdminRole",
+                                                "Arn"
+                                            ]
+                                        },
+                                        {
+                                            "Fn::Join": [
+                                                "",
+                                                [
+                                                    "arn:aws:iam::",
+                                                    {
+                                                        "Ref": "AWS::AccountId"
+                                                    },
+                                                    ":role/",
+                                                    {
+                                                        "Fn::FindInMap": [
+                                                            "RoleMap",
+                                                            "Roles",
+                                                            "TFAdminRoleName"
+                                                        ]
+                                                    }
+                                                ]
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Users": [
+                    {
+                        "Ref": "TFStateUser"
+                    }
+                ]
+            }
+        },
+        "TFStateUserServicePolicy": {
+            "Type": "AWS::IAM::Policy",
+            "Condition": "ProvisionTFUserPolicy",
+            "Metadata": {
+                "cfn_nag": {
+                    "rules_to_suppress": [
+                        {
+                            "id": "F11",
+                            "reason": "Assigning policy to user because the scope of these permissions pertains only to the TF Admin IAM User."
+                        },
+                        {
+                            "id": "W12",
+                            "reason": "The iam:GetAccountPasswordPolicy permission requires to be set to * to be able to grab the global password policy."
+                        }
+                    ]
+                }
+            },
+            "Properties": {
+                "PolicyName": "Terraform-State-User-ServicePolicy",
+                "PolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Sid": "S3TFStateAccessPolicy",
+                            "Effect": "Allow",
+                            "Action": [
+                                "s3:PutObject",
+                                "s3:GetObject",
+                                "s3:ListBucket"
+                            ],
+                            "Resource": [
+                                {
+                                    "Fn::GetAtt": [
+                                        "TFStateBucket",
+                                        "Arn"
+                                    ]
+                                },
+                                {
+                                    "Fn::Join": [
+                                        "/",
+                                        [
+                                            {
+                                                "Fn::GetAtt": [
+                                                    "TFStateBucket",
+                                                    "Arn"
+                                                ]
+                                            },
+                                            "*"
+                                        ]
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "Sid": "DynamoDBTFStateLockTablePolicy",
+                            "Effect": "Allow",
+                            "Action": [
+                                "dynamodb:GetItem",
+                                "dynamodb:PutItem",
+                                "dynamodb:DeleteItem"
+                            ],
+                            "Resource": [
+                                {
+                                    "Fn::GetAtt": [
+                                        "DynamoTFLockTable",
+                                        "Arn"
+                                    ]
+                                },
+                                {
+                                    "Fn::Join": [
+                                        "/",
+                                        [
+                                            {
+                                                "Fn::GetAtt": [
+                                                    "DynamoTFLockTable",
+                                                    "Arn"
+                                                ]
+                                            },
+                                            "index",
+                                            "*"
+                                        ]
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "Sid": "AssumeTFAdminRole",
+                            "Effect": "Allow",
+                            "Action": [
+                                "sts:AssumeRole"
+                            ],
+                            "Resource": [
+                                {
+                                    "Fn::If": [
+                                        "CreateRole",
+                                        {
+                                            "Fn::GetAtt": [
+                                                "TFAdminRole",
+                                                "Arn"
+                                            ]
+                                        },
+                                        {
+                                            "Fn::Join": [
+                                                "",
+                                                [
+                                                    "arn:aws:iam::",
+                                                    {
+                                                        "Ref": "AWS::AccountId"
+                                                    },
+                                                    ":role/",
+                                                    {
+                                                        "Fn::FindInMap": [
+                                                            "RoleMap",
+                                                            "Roles",
+                                                            "TFAdminRoleName"
+                                                        ]
+                                                    }
+                                                ]
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "Users": [
+                    {
+                        "Ref": "TFStateUser"
+                    }
+                ]
+            }
+        }
+    },
+    "Outputs": {
+        "TFStateKMSKeyID": {
+            "Condition": "ProvisionCMK",
+            "Description": "The ID of the KMS key that will be used to encrypt the Terraform state bucket.",
+            "Value": {
+                "Ref": "TFStateKMSKey"
+            },
+            "Export": {
+                "Name": "TFState-CMK"
+            }
+        },
+        "TFStateKMSKeyArn": {
+            "Condition": "ProvisionCMK",
+            "Description": "The ARN of the KMS key that will be used to encrypt the Terraform state bucket.",
+            "Value": {
+                "Fn::GetAtt": [
+                    "TFStateKMSKey",
+                    "Arn"
+                ]
+            },
+            "Export": {
+                "Name": "TFState-CMK-ARN"
+            }
+        },
+        "TFStateKMSKeyAliasName": {
+            "Condition": "ProvisionCMK",
+            "Description": "The Alias of the KMS key that will be used to encrypt the Terraform state bucket.",
+            "Value": {
+                "Ref": "TFStateKMSKeyAlias"
+            },
+            "Export": {
+                "Name": "TFState-CMK-Alias"
+            }
+        },
+        "TFStateBucketName": {
+            "Condition": "ProvisionStateBucket",
+            "Description": "Name of the S3 bucket used to store Terraform State File Objects.",
+            "Value": {
+                "Ref": "TFStateBucket"
+            },
+            "Export": {
+                "Name": "TFState-Bucket"
+            }
+        },
+        "TFStateBucketArn": {
+            "Condition": "ProvisionStateBucket",
+            "Description": "ARN of the S3 bucket used to store Terraform State File Objects.",
+            "Value": {
+                "Fn::GetAtt": [
+                    "TFStateBucket",
+                    "Arn"
+                ]
+            },
+            "Export": {
+                "Name": "TFState-Bucket-ARN"
+            }
+        },
+        "DynamoTFLockTableName": {
+            "Condition": "ProvisionStateBucket",
+            "Description": "Then Name of the DynamoDB lock table used to prevent terraform state change conflicts.",
+            "Value": {
+                "Ref": "DynamoTFLockTable"
+            },
+            "Export": {
+                "Name": "TFState-LockTable"
+            }
+        },
+        "DynamoTFLockTableArn": {
+            "Condition": "ProvisionStateBucket",
+            "Description": "Then ARN of the DynamoDB lock table used to prevent terraform state change conflicts.",
+            "Value": {
+                "Fn::GetAtt": [
+                    "DynamoTFLockTable",
+                    "Arn"
+                ]
+            },
+            "Export": {
+                "Name": "TFState-LockTable-ARN"
+            }
+        },
+        "TFStateUserArn": {
+            "Condition": "ProvisionTFUser",
+            "Description": "The ARN for the Terraform IAM User Account",
+            "Value": {
+                "Fn::GetAtt": [
+                    "TFStateUser",
+                    "Arn"
+                ]
+            },
+            "Export": {
+                "Name": "TFState-User-Arn"
+            }
+        },
+        "TFStateUserKeySecretArn": {
+            "Condition": "ProvisionTFUser",
+            "Description": "The Arn of the secrets manager key that stores the programmatic access keypair provisioned for the Terraform IAM User Account",
+            "Value": {
+                "Ref": "TFStateUserKeySecret"
+            },
+            "Export": {
+                "Name": "TFState-User-Key-Arn"
+            }
+        },
+        "TFStateUserIAMPolicyId": {
+            "Condition": "ProvisionTFUser",
+            "Description": "The Id for user policy applied to the Terraform user granting the ability to self manage only the created users IAM properties.",
+            "Value": {
+                "Ref": "TFStateUserIAMPolicy"
+            }
+        },
+        "TFStateUserServicePolicyId": {
+            "Condition": "ProvisionTFUserPolicy",
+            "Description": "The Id for user policy applied to the Terraform user granting the ability Assume the admin role, write to S3, and DynamoDB TFState resources.",
+            "Value": {
+                "Ref": "TFStateUserServicePolicy"
+            }
+        },
+        "TFAdminRoleName": {
+            "Description": "The Name of the Role created for the TerraForm user that grants the Terraform user admin privileges to launch resources.",
+            "Value": {
+                "Fn::FindInMap": [
+                    "RoleMap",
+                    "Roles",
+                    "TFAdminRoleName"
+                ]
+            },
+            "Export": {
+                "Name": "TFState-Admin-Role"
+            }
+        },
+        "TFAdminRoleArn": {
+            "Description": "The ARN of the Role created for the TerraForm user that grants the Terraform user admin privileges to launch resources.",
+            "Value": {
+                "Fn::Join": [
+                    "",
+                    [
+                        "arn:aws:iam::",
+                        {
+                            "Ref": "AWS::AccountId"
+                        },
+                        ":role/",
+                        {
+                            "Fn::FindInMap": [
+                                "RoleMap",
+                                "Roles",
+                                "TFAdminRoleName"
+                            ]
+                        }
+                    ]
+                ]
+            },
+            "Export": {
+                "Name": "TFState-Admin-Role-ARN"
+            }
+        }
+    }
+}

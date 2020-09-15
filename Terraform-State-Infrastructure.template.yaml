@@ -1,0 +1,586 @@
+AWSTemplateFormatVersion: "2010-09-09"
+# Description of what this CloudFormation Template is going to produce
+Description: AWS CloudFormation Template to prepare an account for Terraform usage. Creates state encrypted bucket, dynamo table, user, role.
+# StackName: AWS-Terraforma-StateFile-Framework
+
+##############################################################################
+# NOTES: This template uses Exports produced by the following CF Templates
+#-----------------------------------------------------------------------------
+# PreReq-Required-Templates:
+#   - None
+##############################################################################
+
+# ###############################################
+# Template Parameters:
+# User Input values required for this template
+# ###############################################
+Parameters:
+  CreateTFAdminRole:
+    Description:  Create a Terraform administrator role that would have Administrator permissions, to allow the assumer of the role to deploy  
+                  resources into the account. Note this value should only be set to false if the role has already been deployed into the account previously.
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "true"
+  
+  CreateTFUser:
+    Description:  Create a Terraform user that would have ReadOnly permissions, the ability to manage its own IAM password/mfa,
+                  and the ability to assume the TerraForm Admin Role.
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "true"
+
+  TFUserKeySerial:
+    Description: The serial number of the provisioned TFStateUser IAM user programmatic access key. Incrementing this number from its current value will rotate the user key
+                 during the next stack update.
+    Type: Number
+    Default: 1
+
+  AdditionalAdminRoleAccess:
+    Description: Optional => Role ARNs supplied will have access to assume the TFAdmin Role. This should be input as a comma separated non spaced string such as "User1ARN,User2ARN,User3ARN"
+    Type: CommaDelimitedList
+
+  CreateStateBucket:
+    Description: Create an encrypted Terraform state bucket to be used to store Terraform state and infrastructure changes. If using a product
+                 such as Terraform Cloud, or Terraform Enterprise that manages state for you, then choose false to skip creating this resource.
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "true"
+
+  CreateSharedKMSKey:
+    Description: Create a sharable KMS CMK that will be used to encrypt the objects stored in the Terraform state bucket, as well as the
+                 Terraform state lock table in DynamoDB. If "false" is selected then the standard AWS managed key s3/dynamo keys will be used.
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "true"
+
+  SharedKMSKeyAlias:
+    Description: Specify the alias that will be set on the optionally provisioned shared KMS CMK. Note 'alias/' will automatically be appended to the key and should not be specified in this parameter.
+    Type: String
+    Default: "terraform/state"
+
+# ################################################
+# Template MetaData:
+# Define Template Parameter Form rendering.
+# ################################################
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Template Parameters"
+        Parameters:
+          - CreateTFAdminRole
+          - CreateTFUser
+          - CreateStateBucket
+          - CreateSharedKMSKey
+      - Label:
+          default: "Optional Template Parameters"
+        Parameters:
+          - AdditionalAdminRoleAccess
+          - TFUserKeySerial
+          - SharedKMSKeyAlias
+    ParameterLabels:
+      CreateTFAdminRole:
+        default: Provision Terraform IAM Admin Role?
+      CreateTFUser:
+        default: Provision Terraform IAM User?
+      CreateStateBucket:
+        default: Provision Terraform encrypted state bucket?
+      CreateSharedKMSKey:
+        default: Provision Terraform sharable KMS Customer Managed Key (CMK)?
+      AdditionalAdminRoleAccess:
+        default: Specify any existing IAM Role ARNs that will be granted access to assume the Terraform admin role.
+      TFUserKeySerial:
+        default: Serial Number for the TFState IAM users programmatic access keys.
+      SharedKMSKeyAlias:
+        default: Specify the Alias for the KMS CMK if provisioned.
+
+# ###############################################
+# Template Mappings:
+# Define any static Key:Value mappings required.
+# ###############################################
+Mappings: 
+  RoleMap:
+    Roles:
+      TFAdminRoleName: TerraForm-Infrastructure-Services-Admin-Role
+
+# ###############################################
+# Template Conditions:
+# Define any conditions for launching Resources.
+# ###############################################
+Conditions:
+  # True if the current region the template is running in matches the configured value in the RoleMap.
+  CreateRole: !Equals [!Ref CreateTFAdminRole, "true"]
+  # True if both CreateRole and ProvisionTFUser are 'true'
+  ProvisionTFUser: !And
+    - !Condition CreateRole
+    - !Equals [!Ref CreateTFUser, "true"]
+  ProvisionStateBucket: !Equals [!Ref CreateStateBucket, "true"]
+  ProvisionCMK: !Equals [!Ref CreateSharedKMSKey, "true"]
+  RequestedRoleAccess: !Not [!Equals [!Join [",", !Ref AdditionalAdminRoleAccess], ""]]
+  ProvisionTFUserPolicy: !And
+    - !Condition ProvisionTFUser
+    - !Condition ProvisionStateBucket
+
+# ###############################################
+# Template Resources:
+# Define AWS Resources that will be provisioned.
+# ###############################################
+Resources:
+  #========================
+  # IAM Role:
+  #========================
+  TFAdminRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRole
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Static Name assigned, via mapping, for export consistency accross regions/accounts
+    Properties:
+      RoleName: !FindInMap [ RoleMap, Roles, TFAdminRoleName ]
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Split
+                - ","
+                - !Join
+                  - ","
+                  - - !If [ProvisionTFUser, !GetAtt 'TFStateUser.Arn', !Ref 'AWS::AccountId']
+                    - !If [RequestedRoleAccess, !Join [",", !Ref AdditionalAdminRoleAccess], !Ref "AWS::NoValue"]
+            Action:
+              - sts:AssumeRole
+            # If condition is used, the TFUser will not be able to auto assume the role.
+            # Condition: {"Bool": {"aws:MultiFactorAuthPresent": "true" }}
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  # -------------------------
+  # S3 TFState KMS Key
+  # IAM assigned ownership and administrator rights
+  # TFAdmin Role assigned Usage Rights
+  # -------------------------
+  TFStateKMSKey:
+    Condition: ProvisionCMK
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Terraform State Infrastructure KMS Encryption Key
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: !Sub "Terraform-State-CMK-Policy-${AWS::Region}"
+        Statement:
+          - Sid: TFStateKeyOwnerPolicy
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - "kms:*"
+            Resource: "*"
+          - Sid: TFStateKeyAdminPolicy
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: 
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          - Sid: TFStateKeyUsagePolicy
+            Effect: Allow
+            Principal:
+              AWS: !If [CreateRole, !GetAtt 'TFAdminRole.Arn' , !Join ["", ["arn:aws:iam::", !Ref 'AWS::AccountId', ":role/", !FindInMap [ RoleMap, Roles, TFAdminRoleName ]]]]
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+
+  TFStateKMSKeyAlias:
+    Condition: ProvisionCMK
+    Type: AWS::KMS::Alias
+    Properties: 
+      AliasName: !Sub "alias/${SharedKMSKeyAlias}"
+      TargetKeyId: !GetAtt 'TFStateKMSKey.Arn'
+
+  # ----------------------------
+  # S3 TFState Buckets:
+  # ----------------------------
+  TFStateBucket:
+    Type: AWS::S3::Bucket
+    Condition: ProvisionStateBucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: Logging bucket can be setup with TerraForm once access is granted.
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-terraform-state-bucket-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [ProvisionCMK, aws:kms, AES256]
+              KMSMasterKeyID: !If [ProvisionCMK, !Ref TFStateKMSKey, !Ref 'AWS::NoValue']
+
+  # --------------------------------
+  # S3 TFState Bucket Policy:
+  # --------------------------------
+  TFStateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: ProvisionStateBucket
+    Properties:
+      Bucket: !Ref TFStateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyNonSecureTransport"
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action:
+              - "s3:*"
+            Resource:
+              - !GetAtt 'TFStateBucket.Arn'
+              - !Join ['/', [!GetAtt 'TFStateBucket.Arn', "*"]]
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: "DenyIncorrectEncryptionHeader"
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action: "s3:PutObject"
+            Resource:
+              - !GetAtt 'TFStateBucket.Arn'
+              - !Join ['/', [!GetAtt 'TFStateBucket.Arn', "*"]]
+            Condition: { "ForAnyValue:StringNotEquals": {"s3:x-amz-server-side-encryption":["aws:kms", "AES256"] }}
+          - Sid: DenyUnEncryptedObjectUploads
+            Effect: Deny
+            Principal:
+              AWS: "*"
+            Action: "s3:PutObject"
+            Resource:
+              - !GetAtt 'TFStateBucket.Arn'
+              - !Join ['/', [!GetAtt 'TFStateBucket.Arn', "*"]]
+            Condition: {"Null": {"s3:x-amz-server-side-encryption": "true"}}
+          - Sid: AllowTFAdminUsage
+            Effect: Allow
+            Principal:
+              AWS: !If [CreateRole, !GetAtt 'TFAdminRole.Arn' , !Join ["", ["arn:aws:iam::", !Ref 'AWS::AccountId', ":role/", !FindInMap [ RoleMap, Roles, TFAdminRoleName ]]]]
+            Action: "s3:*"
+            Resource:
+              - !GetAtt 'TFStateBucket.Arn'
+              - !Join ['/', [!GetAtt 'TFStateBucket.Arn', "*"]]
+
+  #=============================
+  # DynamoDB Artifact Table:
+  #=============================
+  DynamoTFLockTable:
+    Type: AWS::DynamoDB::Table
+    Condition: ProvisionStateBucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: Static Name assigned for consistency accross accounts and to be more easily identified within TF
+    Properties:
+      TableName: "Terraform-State-Lock-Table"
+      AttributeDefinitions: 
+        - AttributeName: "LockID"
+          AttributeType: "S"
+      KeySchema:
+        # Primary Key
+        - AttributeName: "LockID"
+          KeyType: "HASH"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      SSESpecification:
+        SSEType: !If [ProvisionCMK, KMS, !Ref 'AWS::NoValue']
+        SSEEnabled: !If [ProvisionCMK, true, false]
+        KMSMasterKeyId: !If [ProvisionCMK, !Ref TFStateKMSKey, !Ref 'AWS::NoValue']
+
+  #===============================
+  # IAM Terraform Users:
+  #===============================
+  TFStateUser:
+    Type: AWS::IAM::User
+    Condition: ProvisionTFUser
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F2000
+            reason: User not assigned to group as group is un-necessary for single TF user, use case.
+    Properties:
+      UserName: Terraform
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+
+  TFStateUserKey:
+    Type: AWS::IAM::AccessKey
+    Condition: ProvisionTFUser
+    Properties:
+      Serial: !Ref TFUserKeySerial
+      Status: Active
+      UserName: !Ref TFStateUser
+
+  # Commenting out and replacing with Secrets Manager as CFN does not yet support storing securestings
+  # TFStateUserKeySSMParam:
+  #   Type: AWS::SSM::Parameter
+  #   Condition: ProvisionTFUser
+  #   Properties:
+  #     Description: TFState User Programmatic Access KeyPair
+  #     Name: /Terraform/StateUser/AccessKey
+  #     Type: String
+  #     Value: !Join [" : ", [!Ref TFStateUserKey, !GetAtt 'TFStateUserKey.SecretAccessKey']]
+
+  TFStateUserKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: ProvisionTFUser
+    Properties:
+      Description: TFState User Programmatic Access KeyPair
+      KmsKeyId: !If [ProvisionCMK, !Ref TFStateKMSKey, !Ref 'AWS::NoValue']
+      Name: /Terraform/StateUser/AccessKeyPair
+      SecretString: !Sub "{\"AccessKey\": \"${TFStateUserKey}\", \"Secret\": \"${TFStateUserKey.SecretAccessKey}\"}"
+
+  #===============================
+  # Terraform User IAM Policies:
+  #===============================
+  TFStateUserIAMPolicy:
+    Type: AWS::IAM::Policy
+    Condition: ProvisionTFUser
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F11
+            reason: Assigning policy to user because the scope of these permissions pertains only to the TF Admin IAM User.
+          - id: W12
+            reason: The iam:GetAccountPasswordPolicy permission requires to be set to * to be able to grab the global password policy.
+    Properties: 
+      PolicyName: Terraform-State-User-IAM-AccessPolicy
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Sid: AllowGetIAMSelfDetails
+            Effect: Allow
+            Action: 
+              - iam:GetAccountPasswordPolicy
+              - iam:ListVirtualMFADevices
+            Resource: "*"
+          - Sid: AllowManageIAMSelfPassword
+            Effect: Allow
+            Action:
+              - iam:GetUser
+              - iam:ChangePassword
+            Resource: !Join ['', [ 'arn:aws:iam::', !Ref 'AWS::AccountId', ':user/${aws:username}']]
+          - Sid: AllowManageIAMSelfMFADevice
+            Effect: Allow
+            Action:
+              - iam:CreateVirtualMFADevice
+              - iam:DeleteVirtualMFADevice
+            Resource: !Join ['', [ 'arn:aws:iam::', !Ref 'AWS::AccountId', ':mfa/${aws:username}']]
+          - Sid: AllowManageIAMSelfMFA
+            Effect: Allow
+            Action:
+              - iam:DeactivateMFADevice
+              - iam:EnableMFADevice
+              - iam:GetUser
+              - iam:ListMFADevices
+              - iam:ResyncMFADevice
+            Resource: !Join ['', [ 'arn:aws:iam::', !Ref 'AWS::AccountId', ':user/${aws:username}']]
+          - Sid: AssumeTFAdminRole
+            Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Resource:
+              # Manually construct the Role ARN, to remove a circular dependency condition
+              - !If [CreateRole, !GetAtt 'TFAdminRole.Arn' , !Join ["", ["arn:aws:iam::", !Ref 'AWS::AccountId', ":role/", !FindInMap [ RoleMap, Roles, TFAdminRoleName ]]]]
+          # If MFA Enforced, TFCloud/TFEnterprise will not be able to utilize the user account.
+          # - Sid: DenyAllExceptIAMSelfNoMFA
+          #   Effect: Deny
+          #   NotAction:
+          #     - iam:CreateVirtualMFADevice
+          #     - iam:EnableMFADevice
+          #     - iam:GetUser
+          #     - iam:ChangePassword
+          #     - iam:ListMFADevices
+          #     - iam:ListVirtualMFADevices
+          #     - iam:ResyncMFADevice
+          #     - sts:GetSessionToken
+          #   Resource: "*"
+          #   Condition:
+          #     BoolIfExists: {"aws:MultiFactorAuthPresent": "false"}
+      Users:
+        - !Ref TFStateUser
+
+  TFStateUserServicePolicy:
+    Type: AWS::IAM::Policy
+    Condition: ProvisionTFUserPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: F11
+            reason: Assigning policy to user because the scope of these permissions pertains only to the TF Admin IAM User.
+          - id: W12
+            reason: The iam:GetAccountPasswordPolicy permission requires to be set to * to be able to grab the global password policy.
+    Properties: 
+      PolicyName: Terraform-State-User-ServicePolicy
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Sid: S3TFStateAccessPolicy
+            Effect: Allow
+            Action: 
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt 'TFStateBucket.Arn'
+              - !Join ['/', [!GetAtt 'TFStateBucket.Arn', "*"]]
+          - Sid: DynamoDBTFStateLockTablePolicy
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:DeleteItem
+            Resource:
+              - !GetAtt 'DynamoTFLockTable.Arn'
+              - !Join ['/', [!GetAtt 'DynamoTFLockTable.Arn', 'index', '*']]
+          - Sid: AssumeTFAdminRole
+            Effect: Allow
+            Action: 
+              - sts:AssumeRole
+            Resource:
+              # Manually construct the Role ARN, to remove a circular dependency condition
+              - !If [CreateRole, !GetAtt 'TFAdminRole.Arn' , !Join ["", ["arn:aws:iam::", !Ref 'AWS::AccountId', ":role/", !FindInMap [ RoleMap, Roles, TFAdminRoleName ]]]]
+      Users:
+        - !Ref TFStateUser
+
+# ##############################################
+# Template Outputs:
+# Specify any outputs for the stack.
+# ##############################################
+Outputs:
+  # State Bucket
+  # Build Artifact KMS Keys and Buckets
+  TFStateKMSKeyID:
+    Condition: ProvisionCMK
+    Description: The ID of the KMS key that will be used to encrypt the Terraform state bucket.
+    Value: !Ref TFStateKMSKey
+    Export:
+      Name: TFState-CMK
+
+  TFStateKMSKeyArn:
+    Condition: ProvisionCMK
+    Description: The ARN of the KMS key that will be used to encrypt the Terraform state bucket.
+    Value: !GetAtt 'TFStateKMSKey.Arn'
+    Export:
+      Name: TFState-CMK-ARN
+
+  TFStateKMSKeyAliasName:
+    Condition: ProvisionCMK
+    Description: The Alias of the KMS key that will be used to encrypt the Terraform state bucket.
+    Value: !Ref TFStateKMSKeyAlias
+    Export:
+      Name: TFState-CMK-Alias
+
+  TFStateBucketName:
+    Condition: ProvisionStateBucket
+    Description: Name of the S3 bucket used to store Terraform State File Objects.
+    Value: !Ref TFStateBucket
+    Export:
+      Name: TFState-Bucket
+  
+  TFStateBucketArn:
+    Condition: ProvisionStateBucket
+    Description: ARN of the S3 bucket used to store Terraform State File Objects.
+    Value: !GetAtt 'TFStateBucket.Arn'
+    Export:
+      Name: TFState-Bucket-ARN
+
+  # DynamoDB Table
+  DynamoTFLockTableName:
+    Condition: ProvisionStateBucket
+    Description: Then Name of the DynamoDB lock table used to prevent terraform state change conflicts.
+    Value: !Ref DynamoTFLockTable
+    Export:
+      Name: 'TFState-LockTable'
+  
+  DynamoTFLockTableArn:
+    Condition: ProvisionStateBucket
+    Description: Then ARN of the DynamoDB lock table used to prevent terraform state change conflicts.
+    Value: !GetAtt 'DynamoTFLockTable.Arn'
+    Export:
+      Name: 'TFState-LockTable-ARN'
+
+  # User
+  TFStateUserArn:
+    Condition: ProvisionTFUser
+    Description: The ARN for the Terraform IAM User Account
+    Value: !GetAtt 'TFStateUser.Arn'
+    Export:
+      Name: TFState-User-Arn
+
+  # Commenting out and replacing with Secrets Manager as CFN does not yet support storing securestings
+  # TFStateUserKeyParam:
+  #   Condition: ProvisionTFUser
+  #   Description: The programmatic access keypair provisioned for the Terraform IAM User Account
+  #   Value: !Join [":",[ "User Key stored in SSM Parameter store using parameter name", !Ref TFStateUserKeySSMParam ]]
+  #   Export:
+  #     Name: TFState-User-Key
+
+  TFStateUserKeySecretArn:
+    Condition: ProvisionTFUser
+    Description: The Arn of the secrets manager key that stores the programmatic access keypair provisioned for the Terraform IAM User Account
+    Value: !Ref TFStateUserKeySecret
+    Export:
+      Name: TFState-User-Key-Arn
+
+  # User Policies
+  TFStateUserIAMPolicyId:
+    Condition: ProvisionTFUser
+    Description: The Id for user policy applied to the Terraform user granting the ability to self manage only the created users IAM properties.
+    Value: !Ref TFStateUserIAMPolicy
+
+  TFStateUserServicePolicyId:
+    Condition: ProvisionTFUserPolicy
+    Description: The Id for user policy applied to the Terraform user granting the ability Assume the admin role, write to S3, and DynamoDB TFState resources.
+    Value: !Ref TFStateUserServicePolicy
+
+  # Role
+  TFAdminRoleName:
+    Description: The Name of the Role created for the TerraForm user that grants the Terraform user admin privileges to launch resources.
+    Value: !FindInMap [ RoleMap, Roles, TFAdminRoleName ]
+    Export:
+      Name: 'TFState-Admin-Role'
+
+  TFAdminRoleArn:
+    Description: The ARN of the Role created for the TerraForm user that grants the Terraform user admin privileges to launch resources.
+    Value: !Join ['',['arn:aws:iam::', !Ref 'AWS::AccountId', ':role/', !FindInMap [ RoleMap, Roles, TFAdminRoleName ]]]
+    Export:
+      Name: 'TFState-Admin-Role-ARN'
